@@ -679,6 +679,7 @@ class RoomPlayer:
         track = self.current
         return {
             "room": self.zone.name,
+            "uid": self.zone.uid,
             "playerName": self.name,
             "machineIdentifier": self.machine_identifier,
             "port": self.port,

@@ -147,6 +147,8 @@ class Bridge:
         self._tasks: list[asyncio.Task] = []
         self._link: dict[str, object] = {}
         self._link_task: asyncio.Task | None = None
+        self._room_links: dict[str, dict[str, object]] = {}
+        self._room_link_tasks: dict[str, asyncio.Task] = {}
         self.updater: Updater | None = None
         self._update_task: asyncio.Task | None = None
         self._update_state: dict[str, object] = {}
@@ -159,6 +161,19 @@ class Bridge:
     # ------------------------------------------------------------------
     def player_for_zone(self, uid: str) -> RoomPlayer | None:
         return self.players.get(uid)
+
+    def room_link_status(self, uid: str) -> dict[str, object]:
+        player = self.player_for_zone(uid)
+        if player is None:
+            return {"linked": False, "username": ""}
+
+        linked = bool(
+            self.identity.room_token(player.machine_identifier)
+        )
+        return {
+            "linked": linked,
+            "username": self.identity.username if linked else "",
+        }
 
     def _room_list(self) -> list[RoomPlayer]:
         return list(self.players.values())
@@ -526,7 +541,7 @@ class Bridge:
         await self.stop()
 
     async def _publish_room(self, player: RoomPlayer) -> None:
-        if not self.account or not self.identity.linked:
+        if not self.account:
             return
         uri = f"http://{self.bridge_ip}:{player.port}"
         if await self.account.publish(player.machine_identifier, player.name, uri):
@@ -596,6 +611,34 @@ class Bridge:
         self._link_task = asyncio.create_task(self._await_link(code))
         return code
 
+    async def begin_room_link(self, uid: str) -> LinkCode:
+        """Begin Plex authorization for one Sonos room."""
+        if self.account is None:
+            raise PlexAuthError("the bridge is still starting up")
+
+        player = self.player_for_zone(uid)
+        if player is None:
+            raise PlexAuthError("room not found")
+
+        code = await self.account.request_pin(
+            player.machine_identifier, player.name
+        )
+
+        self._room_links[uid] = {
+            "code": code.code,
+            "error": "",
+            "pending": True,
+        }
+
+        old_task = self._room_link_tasks.get(uid)
+        if old_task:
+            old_task.cancel()
+
+        self._room_link_tasks[uid] = asyncio.create_task(
+            self._await_room_link(uid, player, code)
+        )
+        return code
+
     async def _await_link(self, code: LinkCode) -> None:
         try:
             token = await self.account.wait_for_pin(code)
@@ -612,6 +655,48 @@ class Bridge:
         except Exception as exc:
             self._link = {"code": "", "error": str(exc), "pending": False}
             LOGGER.exception("Plex linking failed")
+
+    async def _await_room_link(
+        self, uid: str, player: RoomPlayer, code: LinkCode
+    ) -> None:
+        """Complete Plex authorization for one Sonos room."""
+        try:
+            token = await self.account.wait_for_pin(
+                code,
+                client_id=player.machine_identifier,
+                name=player.name,
+            )
+            await self.account.adopt_room_token(
+                player.machine_identifier, player.name, token
+            )
+
+            self._room_links[uid] = {
+                "code": "",
+                "error": "",
+                "pending": False,
+            }
+
+            LOGGER.info("Linked %s to Plex", player.name)
+            await self._publish_room(player)
+
+        except asyncio.CancelledError:
+            raise
+
+        except PlexAuthError as exc:
+            self._room_links[uid] = {
+                "code": "",
+                "error": str(exc),
+                "pending": False,
+            }
+            LOGGER.warning("Plex room linking failed for %s: %s", player.name, exc)
+
+        except Exception as exc:
+            self._room_links[uid] = {
+                "code": "",
+                "error": str(exc),
+                "pending": False,
+            }
+            LOGGER.exception("Plex room linking failed for %s", player.name)
 
     def link_status(self) -> dict[str, object]:
         return {
@@ -642,7 +727,11 @@ class Bridge:
 
     # ------------------------------------------------------------------
     async def status(self) -> dict[str, object]:
-        rooms = [player.status() for player in self._room_list()]
+        rooms = []
+        for player in self._room_list():
+            room = player.status()
+            room["plex"] = self.room_link_status(player.zone.uid)
+            rooms.append(room)
         rooms.sort(key=lambda room: str(room["room"]).casefold())
         payload: dict[str, object] = {
             "name": BRIDGE_NAME,

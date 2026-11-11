@@ -113,6 +113,7 @@ class PlexIdentity:
         self.client_id = str(uuid.uuid4())
         self.token = config.plex_token
         self.username = ""
+        self.room_tokens: dict[str, str] = {}
         self._token_from_env = bool(config.plex_token)
         self._load()
 
@@ -128,6 +129,13 @@ class PlexIdentity:
             return
         self.client_id = saved.get("client_id") or self.client_id
         self.username = saved.get("username", "") or ""
+        room_tokens = saved.get("room_tokens", {})
+        if isinstance(room_tokens, dict):
+    	    self.room_tokens = {
+                str(client_id): str(token)
+       	        for client_id, token in room_tokens.items()
+                if client_id and token
+    	    }
         # An explicit PLEX_TOKEN is a deliberate act and outranks a stored one.
         if not self._token_from_env:
             self.token = saved.get("token", "") or ""
@@ -138,7 +146,8 @@ class PlexIdentity:
             "client_id": self.client_id,
             "token": self.token,
             "username": self.username,
-        }
+            "room_tokens": self.room_tokens,
+	}
         temp = self.path.with_suffix(".json.tmp")
         # Created private, so the token is never readable by others, even briefly.
         descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -156,6 +165,23 @@ class PlexIdentity:
         self.token = ""
         self.username = ""
         self.save()
+
+    def room_token(self, client_id: str) -> str:
+        """Return the Plex token registered for one room."""
+        return self.room_tokens.get(client_id, "")
+
+    def set_room_token(self, client_id: str, token: str) -> None:
+        """Persist a room's Plex token without changing the bridge token."""
+        if not client_id or not token:
+            raise ValueError("A room client ID and token are required")
+        self.room_tokens[client_id] = token
+        self.save()
+
+    def forget_room_token(self, client_id: str) -> None:
+        """Forget one room's token without affecting other identities."""
+        self.room_tokens.pop(client_id, None)
+        self.save()
+
 
     @property
     def linked(self) -> bool:
@@ -203,14 +229,23 @@ class PlexAccount:
         client_id: str = "",
         name: str = "",
         token: str | None = None,
+        data: str | bytes | None = None,
     ) -> tuple[int, object]:
         headers = self.identity.headers(client_id, name)
         effective = self.identity.token if token is None else token
         if effective:
             headers["X-Plex-Token"] = effective
         try:
+            request_headers = dict(headers)
+            if data is not None:
+                request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+
             async with self._session.request(
-                method, url, headers=headers, timeout=self._timeout
+                method,
+                url,
+                headers=request_headers,
+                data=data,
+                timeout=self._timeout,
             ) as response:
                 raw = await response.text()
                 body: object = raw
@@ -224,14 +259,25 @@ class PlexAccount:
             raise PlexAuthError(f"plex.tv is not reachable: {exc}") from exc
 
     # -- linking --------------------------------------------------------
-    async def request_pin(self) -> LinkCode:
+    #async def request_pin(self) -> LinkCode:
+    async def request_pin(
+        self, client_id: str = "", name: str = ""
+    ) -> LinkCode:
         """Claim a PIN for the user to enter at plex.tv/link.
 
         Deliberately *not* a "strong" PIN.  Asking for one gets a long random
         string meant for an app that pastes it programmatically; the box at
         plex.tv/link takes the short four-character kind, and nothing else.
         """
-        status, body = await self._request("POST", f"{PLEX_TV}/api/v2/pins", token="")
+        #status, body = await self._request("POST", f"{PLEX_TV}/api/v2/pins", token="")
+        status, body = await self._request(
+            "POST",
+            f"{PLEX_TV}/api/v2/pins",
+            client_id=client_id,
+            name=name,
+            token="",
+            data="strong=false",
+        )
         if status not in (200, 201) or not isinstance(body, dict):
             raise PlexAuthError(f"plex.tv would not issue a code (HTTP {status})")
         return LinkCode(
@@ -240,10 +286,10 @@ class PlexAccount:
             expires_at=time.monotonic() + LINK_TIMEOUT,
         )
 
-    async def poll_pin(self, pin: LinkCode) -> str | None:
+    async def poll_pin(self, pin: LinkCode, client_id: str="", name: str="") -> str | None:
         """Has the code been entered yet?  Returns the token once it has."""
         status, body = await self._request(
-            "GET", f"{PLEX_TV}/api/v2/pins/{pin.id}", token=""
+            "GET", f"{PLEX_TV}/api/v2/pins/{pin.id}", token="", client_id=client_id, name=name,
         )
         if status == 404:
             raise PlexAuthError("that code expired before it was entered")
@@ -251,11 +297,11 @@ class PlexAccount:
             return None
         return body.get("authToken") or None
 
-    async def wait_for_pin(self, pin: LinkCode) -> str:
+    async def wait_for_pin(self, pin: LinkCode, client_id: str="", name: str="") -> str:
         """Block until the code is entered, or it expires."""
         while time.monotonic() < pin.expires_at:
             await asyncio.sleep(LINK_POLL_INTERVAL)
-            token = await self.poll_pin(pin)
+            token = await self.poll_pin(pin, client_id=client_id, name=name)
             if token:
                 return token
         raise PlexAuthError("nobody entered the code in time")
@@ -273,6 +319,16 @@ class PlexAccount:
             return ""
         return str(body.get("username") or body.get("title") or body.get("email") or "")
 
+    async def adopt_room_token(
+        self, client_id: str, name: str, token: str
+    ) -> str:
+        """Verify and save a room-specific Plex token."""
+        username = await self.whoami(token)
+        if not username:
+            raise PlexAuthError("Plex room token could not be verified")
+        self.identity.set_room_token(client_id, token)
+        return username
+
     async def verify(self) -> bool:
         """Is the stored token still good?"""
         if not self.identity.linked:
@@ -287,39 +343,23 @@ class PlexAccount:
 
     # -- publishing rooms ----------------------------------------------
     async def publish(self, client_id: str, name: str, uri: str) -> bool:
-        """Register one room as a player on the account, reachable at *uri*.
-
-        Called on every address change and periodically thereafter.  Phones find
-        rooms only through this; desktops manage without it, so a failure here
-        is logged and the bridge carries on rather than refusing to start.
-        """
-        if not self.identity.linked:
+        """Publish a room's local address using its own Plex identity."""
+        room_token = self.identity.room_token(client_id)
+        if not room_token:
+            LOGGER.debug("No Plex token saved for %s; skipping publish", name)
             return False
+
         if self._published.get(client_id) == uri:
             return True
 
-        # Registering the room and giving it an address are two calls, and a
-        # room registered without one is worse than no room at all: a
-        # controller merges the account's record with what it found on the
-        # network, prefers the account's, and then has nowhere to send
-        # anything.  So a half-finished registration is undone rather than
-        # left standing.
-        device_id = None
         try:
-            status, body = await self._request(
-                "POST", f"{PLEX_TV}/devices.xml", client_id=client_id, name=name
+            device_id = await self._device_id(
+                client_id, name, room_token
             )
-            # The numeric id comes back with the registration itself.  Reading
-            # it from the account's resource list instead does not work: that
-            # list is keyed by client identifier and need not carry the id at
-            # all, which left the address unattached.
-            device_id = device_id_from_xml(body, client_id)
-            if device_id is None:
-                device_id = await self._device_id(client_id, name)
             if device_id is None:
                 LOGGER.warning(
-                    "plex.tv registered %s but did not say under which id, so it "
-                    "has no address. Plexamp on a phone will not reach it.",
+                    "Could not find Plex device record for %s; "
+                    "not creating or deleting any device records.",
                     name,
                 )
                 return False
@@ -329,31 +369,40 @@ class PlexAccount:
                 f"{PLEX_TV}/devices/{device_id}?Connection[][uri]={quote(uri, safe='')}",
                 client_id=client_id,
                 name=name,
+                token=room_token,
             )
+
         except PlexAuthError as exc:
             LOGGER.warning("Could not publish %s to plex.tv: %s", name, exc)
-            if device_id is not None:
-                await self.remove_device(device_id)
             return False
 
         if status not in (200, 201, 204):
             LOGGER.warning(
-                "plex.tv would not take the address for %s (HTTP %s); removing the "
-                "registration so it cannot mask the copy found on your network",
+                "plex.tv would not update the address for %s (HTTP %s)",
                 name,
                 status,
             )
-            await self.remove_device(device_id)
             return False
 
         self._published[client_id] = uri
         self._device_ids[client_id] = device_id
-        LOGGER.info("Published %s to plex.tv at %s", name, uri)
+        LOGGER.info("Published %s to Plex at %s", name, uri)
         return True
-
-    async def _device_id(self, client_id: str, name: str) -> str | None:
+    
+    async def _device_id(self, client_id: str, name: str, token: str) -> str | None:
+        # Find the already-linked bridge in the account's authorized devices.
         status, body = await self._request(
-            "GET", f"{PLEX_TV}/api/v2/resources", client_id=client_id, name=name
+            "GET", f"{PLEX_TV}/devices.xml", client_id=client_id, name=name, token=token
+        )
+        if status == 200:
+            device_id = device_id_from_xml(body, client_id)
+            if device_id is not None:
+                return device_id
+
+        # Fall back to the resources list if the authorized-device list
+        # does not contain the bridge.
+        status, body = await self._request(
+            "GET", f"{PLEX_TV}/api/v2/resources", client_id=client_id, name=name, token=token
         )
         if status != 200 or not isinstance(body, list):
             return None
@@ -375,19 +424,16 @@ class PlexAccount:
         return status in (200, 204, 404)
 
     async def remove_all(self) -> int:
-        """Take every room this bridge registered off the account.
-
-        Unlinking has to do this.  Forgetting the token locally would otherwise
-        leave the rooms listed on the account for good, pointing at a bridge
-        that no longer answers for them - and a stale record is exactly what
-        stops a working player being seen.
-        """
+        """Remove each distinct Plex device registered by this bridge."""
         removed = 0
-        for client_id, device_id in list(self._device_ids.items()):
+        device_ids = set(self._device_ids.values())
+
+        for device_id in device_ids:
             if await self.remove_device(device_id):
                 removed += 1
-            self._device_ids.pop(client_id, None)
-            self._published.pop(client_id, None)
+
+        self._device_ids.clear()
+        self._published.clear()
         return removed
 
     def forget_published(self, client_id: str = "") -> None:

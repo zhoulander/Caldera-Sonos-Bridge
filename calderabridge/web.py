@@ -45,6 +45,8 @@ def create_app(bridge) -> web.Application:
     app.router.add_post("/update", handle_update_install)
     app.router.add_get("/room/{uid}/icon.svg", handle_icon_svg)
     app.router.add_get("/room/{uid}/icon/{size}.png", handle_icon_png)
+    app.router.add_post("/room/{uid}/plex/link", handle_room_link)
+    app.router.add_get("/room/{uid}/plex/link", handle_room_link_status)    
     return app
 
 
@@ -118,6 +120,19 @@ async def handle_link(request: web.Request) -> web.Response:
 async def handle_link_status(request: web.Request) -> web.Response:
     return web.json_response(_bridge(request).link_status())
 
+
+async def handle_room_link(request: web.Request) -> web.Response:
+    uid = request.match_info["uid"]
+    try:
+        code = await _bridge(request).begin_room_link(uid)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=502)
+    return web.json_response({"code": code.code, "url": code.url})
+
+
+async def handle_room_link_status(request: web.Request) -> web.Response:
+    uid = request.match_info["uid"]
+    return web.json_response(_bridge(request).room_link_status(uid))
 
 async def handle_unlink(request: web.Request) -> web.Response:
     await _bridge(request).unlink()
@@ -195,21 +210,27 @@ def _duration(ms: object) -> str:
 
 
 def _plex_cell(status: dict, room: dict) -> str:
-    """Whether a phone can reach this room.
+    """Show this room's individual Plex registration status."""
+    plex = room.get("plex", {})
 
-    Worth its own column: a room registered on the account with no address is
-    the one failure that makes a working player *disappear* from Plexamp
-    rather than merely not appear.
-    """
-    if not status["plex"]["linked"]:
-        return '<span class=dim>local network only</span>'
+    if not plex.get("linked"):
+        uid = _esc(room.get("uid", ""))
+        return (
+            '<span class=dim>Not linked</span><br>'
+            f'<button type=button class=primary data-room-link="{uid}">'
+            'Link this room to Plex</button>'
+        )
+
     if room.get("publishedUri"):
-        return f'<span class=ok>published</span><br><span class=dim>{_esc(room["publishedUri"])}</span>'
+        return (
+            '<span class=ok>published</span><br>'
+            f'<span class=dim>{_esc(room["publishedUri"])}</span>'
+        )
+
     return (
         '<span class=bad>not published</span><br>'
-        "<span class=dim>a phone will not see this room</span>"
+        '<span class=dim>a phone will not see this room</span>'
     )
-
 
 def _update_card(status: dict) -> str:
     """Where the running version stands, and what can be done about it."""
@@ -515,6 +536,56 @@ if (linkbtn) {
   });
 }
 
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-room-link]');
+  if (!button) return;
+
+  const uid = button.dataset.roomLink;
+  button.disabled = true;
+  button.textContent = 'Asking plex.tv…';
+
+  try {
+    const res = await fetch(`/room/${encodeURIComponent(uid)}/plex/link`, {
+      method: 'POST'
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || 'Could not request a Plex code');
+
+    const box = document.createElement('div');
+    box.className = 'note';
+    box.innerHTML = 'Open <a target="_blank" rel="noopener">plex.tv/link</a> and enter this code: ';
+    box.querySelector('a').href = body.url;
+
+    const code = document.createElement('strong');
+    code.className = 'code';
+    code.textContent = body.code;
+    box.appendChild(code);
+
+    button.replaceWith(box);
+
+    const poll = setInterval(async () => {
+      try {
+        const s = await (await fetch(
+          `/room/${encodeURIComponent(uid)}/plex/link`
+        )).json();
+
+        if (s.linked) {
+          clearInterval(poll);
+          location.reload();
+        } else if (s.error) {
+          clearInterval(poll);
+          box.textContent = s.error;
+        }
+      } catch (e) {
+        // Try again on the next poll.
+      }
+    }, 2000);
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = 'Link this room to Plex';
+    alert(err.message);
+  }
+});
 const updatebtn = document.getElementById('updatebtn');
 const checkbtn = document.getElementById('checkbtn');
 const updatemsg = document.getElementById('updatemsg');

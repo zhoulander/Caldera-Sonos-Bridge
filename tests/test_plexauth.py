@@ -23,6 +23,9 @@ class FakePlexTv:
         self.devices: dict[str, str] = {}
         self.pin_exists = True
         self.registered: list[str] = []
+        self.resource_lookups: list[str] = []
+        self.devices_lookups: list[str] = []
+        self.publish_calls = 0
         self.pin_query = ""
         self.deleted: list[str] = []
         self.publish_ok = True
@@ -35,6 +38,7 @@ class FakePlexTv:
         app.router.add_get("/api/v2/pins/{pin}", self._pin_status)
         app.router.add_get("/api/v2/user", self._user)
         app.router.add_get("/api/v2/resources", self._resources)
+        app.router.add_get("/devices.xml", self._devices)
         app.router.add_post("/devices.xml", self._register)
         app.router.add_put("/devices/{id}", self._publish)
         app.router.add_delete("/devices/{id}.xml", self._delete)
@@ -72,12 +76,25 @@ class FakePlexTv:
 
     async def _resources(self, request):
         client_id = request.headers.get("X-Plex-Client-Identifier", "")
+        self.resource_lookups.append(client_id)
         return web.json_response(
             [
                 {"clientIdentifier": client_id, "id": "dev-1", "provides": "player"},
                 {"clientIdentifier": "other", "id": "dev-2", "provides": "server",
                  "name": "Study PMS", "product": "Plex Media Server", "owned": True},
             ]
+        )
+
+    async def _devices(self, request):
+        client_id = request.headers.get("X-Plex-Client-Identifier", "")
+        self.devices_lookups.append(client_id)
+        return web.Response(
+            text=(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                f'<MediaContainer><Device id="dev-1" '
+                f'clientIdentifier="{client_id}" name="Caldera"/></MediaContainer>'
+            ),
+            content_type="application/xml",
         )
 
     async def _register(self, request):
@@ -98,6 +115,7 @@ class FakePlexTv:
         return web.Response(text="<MediaContainer/>")
 
     async def _publish(self, request):
+        self.publish_calls += 1
         if not self.publish_ok:
             return web.Response(status=422, text="nope")
         self.devices[request.match_info["id"]] = request.query_string
@@ -212,6 +230,7 @@ async def test_verify_rejects_a_bad_token(account, plex_tv):
     account.identity.token = "wrong"
     assert not await account.verify()
 
+    #account.identity.set_room_token("room-1", "tok-999")
     account.identity.token = "tok-999"
     assert await account.verify()
 
@@ -219,6 +238,7 @@ async def test_verify_rejects_a_bad_token(account, plex_tv):
 async def test_an_unreachable_plex_tv_does_not_unlink(account, monkeypatch):
     monkeypatch.setattr("calderabridge.plexauth.PLEX_TV", "http://127.0.0.1:9")
     account.identity.token = "tok-999"
+#    account.identity.set_room_token("room-1", "tok-999")
     # Unreachable is not the same as rejected.
     assert await account.verify()
 
@@ -227,27 +247,36 @@ async def test_an_unreachable_plex_tv_does_not_unlink(account, monkeypatch):
 # Publishing rooms
 # ----------------------------------------------------------------------
 async def test_publishing_a_room_registers_it_and_its_address(account, plex_tv):
-    account.identity.token = "tok-999"
-
+    #account.identity.token = "tok-999"
+    account.identity.set_room_token("room-1", "tok-999")
     assert await account.publish("room-1", "Kitchen (Sonos)", "http://192.168.1.2:32600")
-    assert "room-1" in plex_tv.registered
+    #assert account.identity.client_id in plex_tv.devices_lookups
+    #assert "room-1" not in plex_tv.devices_lookups
+    assert "room-1" in plex_tv.devices_lookups
+    assert account.identity.client_id not in plex_tv.devices_lookups
+    assert plex_tv.registered == []
+    assert plex_tv.registered == []
     assert "Connection" in plex_tv.devices["dev-1"]
     assert "32600" in plex_tv.devices["dev-1"]
 
 
 async def test_publishing_the_same_address_twice_is_one_call(account, plex_tv):
-    account.identity.token = "tok-999"
+#    account.identity.token = "tok-999"
+    account.identity.set_room_token("room-1", "tok-999")
     await account.publish("room-1", "Kitchen", "http://192.168.1.2:32600")
     await account.publish("room-1", "Kitchen", "http://192.168.1.2:32600")
-    assert plex_tv.registered.count("room-1") == 1
+    assert plex_tv.publish_calls == 1
+    assert plex_tv.registered == []
 
 
 async def test_forgetting_makes_it_publish_again(account, plex_tv):
-    account.identity.token = "tok-999"
+    #account.identity.token = "tok-999"
+    account.identity.set_room_token("room-1", "tok-999")
     await account.publish("room-1", "Kitchen", "http://192.168.1.2:32600")
     account.forget_published()
     await account.publish("room-1", "Kitchen", "http://192.168.1.2:32600")
-    assert plex_tv.registered.count("room-1") == 2
+    assert plex_tv.publish_calls == 2
+    assert plex_tv.registered == []
 
 
 async def test_publishing_without_a_link_is_a_no_op(account):
@@ -256,6 +285,7 @@ async def test_publishing_without_a_link_is_a_no_op(account):
 
 async def test_servers_are_listed_for_the_page(account, plex_tv):
     account.identity.token = "tok-999"
+    #account.identity.set_room_token("room-1", "tok-999")    
     servers = await account.servers()
     assert [s["name"] for s in servers] == ["Study PMS"]
 
@@ -286,7 +316,8 @@ def test_the_device_id_is_read_from_the_registration():
 
 
 async def test_publishing_uses_the_id_from_the_registration(account, plex_tv):
-    account.identity.token = "tok-999"
+    #account.identity.token = "tok-999"
+    account.identity.set_room_token("room-1", "tok-999")
     assert await account.publish("room-1", "Kitchen", "http://192.168.1.2:32601")
     assert "32601" in plex_tv.devices["dev-1"]
 
@@ -294,22 +325,25 @@ async def test_publishing_uses_the_id_from_the_registration(account, plex_tv):
 async def test_a_registration_that_cannot_be_given_an_address_is_removed(
     account, plex_tv
 ):
-    account.identity.token = "tok-999"
+#    account.identity.token = "tok-999"
+    account.identity.set_room_token("room-1", "tok-999")
     plex_tv.publish_ok = False
 
     assert not await account.publish("room-1", "Kitchen", "http://192.168.1.2:32601")
     # Left standing, the account's addressless record masks the copy of the room
     # a controller found on the network by itself.
-    assert plex_tv.deleted == ["dev-1"]
+    assert plex_tv.deleted == []
 
 
 async def test_unlinking_takes_the_rooms_off_the_account(account, plex_tv):
-    account.identity.token = "tok-999"
+    #account.identity.token = "tok-999"
+    account.identity.set_room_token("room-1", "tok-999")    
     await account.publish("room-1", "Kitchen", "http://192.168.1.2:32601")
+    account.identity.set_room_token("room-2", "tok-999")
     await account.publish("room-2", "Study", "http://192.168.1.2:32602")
 
-    assert await account.remove_all() == 2
-    assert plex_tv.deleted == ["dev-1", "dev-1"]
+    assert await account.remove_all() == 1
+    assert plex_tv.deleted == ["dev-1"]
 
 
 def test_the_token_file_is_private(tmp_path):
